@@ -48,20 +48,20 @@ run-fp32:
 # intervention for each of those models on each dataset. Writes results/*.json.
 # Use `just run` for the full 6-model set incl. the XGBoost control baseline.
 run-quick:
-    # uv run modal run modal_app.py::main --dataset adult --models tabpfn,tabicl,tabdpt,xgboost
-    # uv run modal run modal_app.py::main --dataset german_credit --models tabpfn,tabicl,tabdpt,xgboost
-    # uv run modal run modal_app.py::main --dataset bank_marketing --models tabpfn,tabicl,tabdpt,xgboost
-    # uv run modal run modal_app.py::main --dataset acs_income --models tabpfn,tabicl,tabdpt,xgboost
-    # uv run modal run modal_app.py::main --dataset acs_coverage --models tabpfn,tabicl,tabdpt,xgboost
-    # uv run modal run modal_app.py::correction --dataset adult --model tabpfn --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset adult --model tabicl --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset adult --model tabdpt --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset german_credit --model tabpfn --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset german_credit --model tabicl --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset german_credit --model tabdpt --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset bank_marketing --model tabpfn --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset bank_marketing --model tabicl --dtypes fp32,fp16,bf16
-    # uv run modal run modal_app.py::correction --dataset bank_marketing --model tabdpt --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::main --dataset adult --models tabpfn,tabicl,tabdpt,xgboost
+    uv run modal run modal_app.py::main --dataset german_credit --models tabpfn,tabicl,tabdpt,xgboost
+    uv run modal run modal_app.py::main --dataset bank_marketing --models tabpfn,tabicl,tabdpt,xgboost
+    uv run modal run modal_app.py::main --dataset acs_income --models tabpfn,tabicl,tabdpt,xgboost
+    uv run modal run modal_app.py::main --dataset acs_coverage --models tabpfn,tabicl,tabdpt,xgboost
+    uv run modal run modal_app.py::correction --dataset adult --model tabpfn --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset adult --model tabicl --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset adult --model tabdpt --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset german_credit --model tabpfn --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset german_credit --model tabicl --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset german_credit --model tabdpt --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabpfn --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabicl --dtypes fp32,fp16,bf16
+    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabdpt --dtypes fp32,fp16,bf16
     uv run modal run modal_app.py::correction --dataset acs_income --model tabpfn --dtypes fp32,fp16,bf16
     uv run modal run modal_app.py::correction --dataset acs_income --model tabicl --dtypes fp32,fp16,bf16
     uv run modal run modal_app.py::correction --dataset acs_income --model tabdpt --dtypes fp32,fp16,bf16
