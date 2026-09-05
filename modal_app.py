@@ -140,6 +140,18 @@ def _write_json(path: str, obj) -> None:
         json.dump(obj, f, indent=2)
     print(f"Wrote {path}")
 
+
+def _write_prediction_log(name: str, obj) -> None:
+    """Write a normalized per-prediction log to `results/predictions/<name>`.
+
+    Shape: `{dataset, entrypoint, n_test, y_true[], sensitive{attr: [...]},
+    predictions[{...config, correct[]}]}` -- sensitive labels and `y_true` are
+    stored once; each config contributes an index-aligned `correct` vector
+    (1 = correct, 0 = incorrect). Lets post-hoc fairness analysis run without
+    re-executing the Modal pipeline."""
+    _write_json(os.path.join(RESULTS_DIR, "predictions", name), obj)
+
+
 DTYPES = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
 # CPU control ("None") temporarily dropped to speed up sweeps — restore by
 # prepending `None` here (and see the xgboost branch in main()).
@@ -151,6 +163,16 @@ def _load_prepared(dataset: str) -> dict:
 
     with open(_prepared_path(dataset)) as f:
         return json.load(f)
+
+
+@app.function(image=image, timeout=120, volumes={CACHE_DIR: data_volume})
+def test_labels(dataset: str = DEFAULT_DATASET) -> dict:
+    """Ground-truth labels and per-row sensitive-attribute labels for the
+    test split, read straight from the prepared cache. Fetched once per
+    dataset so the shared block of a prediction log isn't shipped per config
+    (`sensitive_test` is already stored as `{attr: [str, ...]}`)."""
+    data = _load_prepared(dataset)
+    return {"y_test": data["y_test"], "sensitive_test": data["sensitive_test"]}
 
 
 @app.function(image=image, timeout=600, volumes={CACHE_DIR: data_volume})
@@ -245,7 +267,7 @@ def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
     import pandas as pd
     import torch
 
-    from tabular_exp.fairness import summarize
+    from tabular_exp.fairness import correct_vector, summarize
     from tabular_exp.models import (
         predict_mlp,
         predict_tabdpt,
@@ -283,6 +305,7 @@ def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
     metrics = summarize(y_test, preds, sensitive_test)
     return {
         "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "correct": correct_vector(y_test, preds),
         **metrics,
     }
 
@@ -402,6 +425,7 @@ def fit_and_eval_correction(
     calib_logprob_by_gpu: dict,
     acc_weights: list[float],
     steps: int,
+    dtype_name: str = "fp32",
 ) -> dict:
     """Fit one correction vector per ``acc_weight`` on the dedicated 20%
     calibration split's logprobs, then score baseline (c=0) and each
@@ -419,7 +443,7 @@ def fit_and_eval_correction(
         centered_logit_l2_drift,
         fit_correction_vector,
     )
-    from tabular_exp.fairness import summarize
+    from tabular_exp.fairness import correct_vector, sensitive_labels, summarize
 
     data = _load_prepared(dataset)
     y_test = np.array(data["y_test"])
@@ -432,11 +456,18 @@ def fit_and_eval_correction(
     calib_lp = {g: np.array(calib_logprob_by_gpu[g], dtype=np.float64) for g in gpus}
     n_classes = test_lp[gpus[0]].shape[1]
 
-    def eval_c(c: np.ndarray) -> dict:
+    # variant key ("baseline" / "acc_weight=<w>") -> {gpu: correct[]}, drained
+    # by the caller into a normalized prediction log.
+    correct_log: dict[str, dict[str, list[int]]] = {}
+
+    def eval_c(c: np.ndarray, variant: str) -> dict:
         per_gpu = {}
+        by_gpu_correct = {}
         for g in gpus:
             preds = apply_correction(test_lp[g], c).argmax(axis=1)
             per_gpu[g] = summarize(y_test, preds, sensitive_test)
+            by_gpu_correct[g] = correct_vector(y_test, preds)
+        correct_log[variant] = by_gpu_correct
         accs = [per_gpu[g]["accuracy"] for g in gpus]
         dps = [per_gpu[g]["demographic_parity_diff"] for g in gpus]
         acc_by_gpu = {g: per_gpu[g]["accuracy"] for g in gpus}
@@ -460,7 +491,7 @@ def fit_and_eval_correction(
         "n_calib": int(len(y_calib)),
         "n_test": int(len(y_test)),
         "mean_l2_logit_drift_vs_t4": centered_logit_l2_drift(test_lp, ref=ref),
-        "baseline": eval_c(np.zeros(n_classes)),
+        "baseline": eval_c(np.zeros(n_classes), "baseline"),
         "corrected": [],
     }
     for w in acc_weights:
@@ -474,9 +505,32 @@ def fit_and_eval_correction(
                 "acc_weight": w,
                 "correction_vector": c.tolist(),
                 "correction_coeff": float(c[0] - c[1]) if n_classes == 2 else centred,
-                **eval_c(c),
+                **eval_c(c, f"acc_weight={w}"),
             }
         )
+
+    predictions = []
+    for variant, by_gpu in correct_log.items():
+        is_baseline = variant == "baseline"
+        for g, correct in by_gpu.items():
+            predictions.append(
+                {
+                    "model": model_name,
+                    "dtype": dtype_name,
+                    "gpu": g,
+                    "variant": "baseline" if is_baseline else "corrected",
+                    "acc_weight": None if is_baseline else float(variant.split("=")[1]),
+                    "correct": correct,
+                }
+            )
+    results["prediction_log"] = {
+        "dataset": dataset,
+        "entrypoint": "correction",
+        "n_test": int(len(y_test)),
+        "y_true": y_test.tolist(),
+        "sensitive": sensitive_labels(sensitive_test),
+        "predictions": predictions,
+    }
     return results
 
 
@@ -528,7 +582,10 @@ def _run_correction(dataset, model, dtype_name, weights, steps):
         calib_lp[gpu] = out["calib_logprob"]
         print(f"{gpu:6s} logprobs from {out['device_name']}")
 
-    res = fit_and_eval_correction.remote(dataset, model, test_lp, calib_lp, weights, steps)
+    res = fit_and_eval_correction.remote(
+        dataset, model, test_lp, calib_lp, weights, steps, dtype_name
+    )
+    plog = res.pop("prediction_log")
 
     b = res["baseline"]
     ref = res["reference_gpu"]
@@ -571,10 +628,11 @@ def _run_correction(dataset, model, dtype_name, weights, steps):
         os.path.join(RESULTS_DIR, f"correction_results-{dataset}-{model}-{dtype_name}.json"),
         res,
     )
+    _write_prediction_log(f"correction-{dataset}-{model}-{dtype_name}.json", plog)
 
 
 @app.function(image=image, timeout=600, volumes={CACHE_DIR: data_volume})
-def drift_points(dataset: str, test_logprob_by_gpu: dict) -> dict:
+def drift_points(dataset: str, test_logprob_by_gpu: dict, model: str = "") -> dict:
     """For one dataset: per GPU, the mean centered-logit L2 drift from T4 (X)
     and the demographic-parity-diff gap from T4 (Y), using each GPU's own
     argmax predictions. CPU-only."""
@@ -582,7 +640,7 @@ def drift_points(dataset: str, test_logprob_by_gpu: dict) -> dict:
     import pandas as pd
 
     from tabular_exp.correction import centered_logit_l2_drift
-    from tabular_exp.fairness import summarize
+    from tabular_exp.fairness import correct_vector, sensitive_labels, summarize
 
     data = _load_prepared(dataset)
     y_test = np.array(data["y_test"])
@@ -593,12 +651,25 @@ def drift_points(dataset: str, test_logprob_by_gpu: dict) -> dict:
     lp = {g: np.array(test_logprob_by_gpu[g], dtype=np.float64) for g in gpus}
     drift = centered_logit_l2_drift(lp, ref=ref)
 
+    preds_by_gpu = {g: lp[g].argmax(axis=1) for g in gpus}
     dp = {
-        g: summarize(y_test, lp[g].argmax(axis=1), sensitive_test)["demographic_parity_diff"]
+        g: summarize(y_test, preds_by_gpu[g], sensitive_test)["demographic_parity_diff"]
         for g in gpus
     }
     return {
         "reference_gpu": ref,
+        "prediction_log": {
+            "dataset": dataset,
+            "entrypoint": "drift",
+            "model": model,
+            "n_test": int(len(y_test)),
+            "y_true": y_test.tolist(),
+            "sensitive": sensitive_labels(sensitive_test),
+            "predictions": [
+                {"model": model, "dtype": "fp32", "gpu": g, "correct": correct_vector(y_test, preds_by_gpu[g])}
+                for g in gpus
+            ],
+        },
         "points": [
             {
                 "gpu": g,
@@ -641,8 +712,9 @@ def drift_correlation(models: str = "tabpfn,tabicl,tabdpt", refresh_data: bool =
                 for gpu in GPU_TYPES
             }
             test_lp = {gpu: call.get()["test_logprob"] for gpu, call in pending.items()}
-            out = drift_points.remote(ds, test_lp)
+            out = drift_points.remote(ds, test_lp, model)
             points.extend(out["points"])
+            _write_prediction_log(f"drift-{model}-{ds}.json", out["prediction_log"])
             print(f"{model:7s} {ds:14s} done ({len(out['points'])} pts)")
 
         stats = pearson.remote([p["x"] for p in points], [p["y"] for p in points])
@@ -705,6 +777,7 @@ def main(
 
     # Populate the dataset cache once (blocks until committed), then fan out.
     prepare_data.remote(dataset=dataset, train_baselines=need_baselines, refresh=refresh_data)
+    labels = test_labels.remote(dataset)
 
     pending = []
     for model_name in models:
@@ -722,9 +795,31 @@ def main(
                 pending.append(({"model": model_name, "gpu": gpu, "dtype": dtype_name}, call))
 
     results = []
+    pred_entries = []
     for meta, call in pending:
         out = call.get()
+        correct = out.pop("correct")
         results.append({**meta, **out})
+        pred_entries.append(
+            {
+                "model": meta["model"],
+                "dtype": meta["dtype"],
+                "gpu": meta["gpu"],
+                "device_name": out["device_name"],
+                "correct": correct,
+            }
+        )
         print(f"{meta['model']:8s} {meta['gpu']:6s} {meta['dtype']:5s} acc={out['accuracy']:.4f}")
 
     _write_json(_out_path("results", dataset), results)
+    _write_prediction_log(
+        f"predictions-{dataset}.json",
+        {
+            "dataset": dataset,
+            "entrypoint": "main",
+            "n_test": len(labels["y_test"]),
+            "y_true": labels["y_test"],
+            "sensitive": labels["sensitive_test"],
+            "predictions": pred_entries,
+        },
+    )

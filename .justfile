@@ -45,30 +45,17 @@ run-fp32:
 
 # Full experiment: sweep TabPFN + TabICL + TabDPT across every dataset x GPU x
 # dtype (fp32 + fp16 + bf16, the `main` defaults), then run the correction-vector
-# intervention for each of those models on each dataset. Writes results/*.json.
-# Use `just run` for the full 6-model set incl. the XGBoost control baseline.
+# intervention for each of those models on each dataset, then the drift
+# correlation. Driven by run_quick.py, which also:
+#   - tees every step's stdout+stderr to results/logs/run-quick-<timestamp>/
+#     (per-step logs + run-quick.log + summary.txt) and keeps going past a
+#     failed step;
+#   - writes per-prediction logs to results/predictions/*.json (per-row
+#     correct/incorrect + sensitive-feature labels) for offline fairness
+#     analysis without re-running the pipeline.
+# Writes results/*.json, results/predictions/*.json, results/logs/run-quick-*/.
 run-quick:
-    uv run modal run modal_app.py::main --dataset adult --models tabpfn,tabicl,tabdpt,xgboost
-    uv run modal run modal_app.py::main --dataset german_credit --models tabpfn,tabicl,tabdpt,xgboost
-    uv run modal run modal_app.py::main --dataset bank_marketing --models tabpfn,tabicl,tabdpt,xgboost
-    uv run modal run modal_app.py::main --dataset acs_income --models tabpfn,tabicl,tabdpt,xgboost
-    uv run modal run modal_app.py::main --dataset acs_coverage --models tabpfn,tabicl,tabdpt,xgboost
-    uv run modal run modal_app.py::correction --dataset adult --model tabpfn --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset adult --model tabicl --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset adult --model tabdpt --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset german_credit --model tabpfn --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset german_credit --model tabicl --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset german_credit --model tabdpt --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabpfn --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabicl --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset bank_marketing --model tabdpt --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_income --model tabpfn --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_income --model tabicl --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_income --model tabdpt --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_coverage --model tabpfn --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_coverage --model tabicl --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::correction --dataset acs_coverage --model tabdpt --dtypes fp32,fp16,bf16
-    uv run modal run modal_app.py::drift_correlation --models tabpfn,tabicl,tabdpt
+    uv run python run_quick.py
 
 # Cross-hardware logit-drift vs fairness-shift correlation (T4 reference):
 # 5 GPU x 5 dataset grid per model, one Pearson R each. Writes

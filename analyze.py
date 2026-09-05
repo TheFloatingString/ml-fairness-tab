@@ -6,6 +6,10 @@ per-group selection rate / TPR / FPR from fairlearn's MetricFrame) move just
 from changing GPU type or compute dtype, with everything else (weights, data,
 seed) held fixed? XGBoost's spread is the near-zero control baseline.
 
+Every disparity is carried as the max-min gap (``*_diff``), its absolute
+value (``*_absdiff`` / ``*_diff_abs``), and a Wald standard error
+(``*_se`` / ``*_diff_se``) -- see tabular_exp/fairness.py.
+
 T4 is the reference GPU: `t4_baseline_report` shows every other GPU's metric
 as a delta from the T4 run. Disparities are reported per sensitive attribute
 (gender / race / age) via the `by_attribute` block.
@@ -43,9 +47,13 @@ def load_results(path: str = "results/results.json") -> pd.DataFrame:
             "device_name": row["device_name"],
             "accuracy": row["accuracy"],
             "accuracy_diff": row.get("accuracy_diff"),
+            "accuracy_diff_se": row.get("accuracy_diff_se"),
             "demographic_parity_diff": row.get("demographic_parity_diff"),
+            "demographic_parity_diff_se": row.get("demographic_parity_diff_se"),
             "equal_opportunity_diff": row.get("equal_opportunity_diff"),
+            "equal_opportunity_diff_se": row.get("equal_opportunity_diff_se"),
             "equalized_odds_diff": row.get("equalized_odds_diff"),
+            "equalized_odds_diff_se": row.get("equalized_odds_diff_se"),
         }
         # fairlearn MetricFrame subgroup breakdowns for the primary attribute.
         for key, prefix in [
@@ -56,10 +64,14 @@ def load_results(path: str = "results/results.json") -> pd.DataFrame:
         ]:
             for group, val in row.get(key, {}).items():
                 rec[f"{prefix}_{group}"] = val
-        # Per-attribute disparities (absolute diff for each of the 3 criteria).
+        # Per-attribute disparities: gap, |gap|, and Wald SE for each of the
+        # 3 criteria.
         for attr, blk in row.get("by_attribute", {}).items():
             for short, crit in _CRITERIA.items():
-                rec[f"{short}_diff__{attr}"] = blk.get(crit, {}).get("diff")
+                c = blk.get(crit, {})
+                rec[f"{short}_diff__{attr}"] = c.get("diff")
+                rec[f"{short}_absdiff__{attr}"] = c.get("abs_diff")
+                rec[f"{short}_se__{attr}"] = c.get("diff_se")
         records.append(rec)
     return pd.DataFrame(records)
 
