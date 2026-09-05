@@ -1,0 +1,10 @@
+[project]
+name = "tabular-exp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=0.64",
+    "pandas>=2.2",
+]

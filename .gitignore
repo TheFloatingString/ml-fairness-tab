@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated experiment artifacts (keep the folder, ignore its contents).
+/results/*
+!/results/.gitkeep
+
+# Next.js frontend
+web/node_modules/
+web/.next/
+web/out/
