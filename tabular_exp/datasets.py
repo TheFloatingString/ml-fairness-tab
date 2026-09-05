@@ -30,7 +30,7 @@ SEED = 42
 # slices are never capped; XGBoost/MLP use the uncapped 80% split. TabICL's
 # 32-member ensemble runs full O(context^2) attention, so the context is kept
 # small to fit a 16 GB T4 (the reference GPU) with headroom.
-CONTEXT_CAP = 1000
+CONTEXT_CAP = 2000
 
 AGE_BINS = [-np.inf, 25, 45, 60, np.inf]
 AGE_LABELS = ["<25", "25-45", "45-60", ">60"]
