@@ -24,18 +24,54 @@ import time
 
 MODELS_MAIN = "tabpfn,tabicl,tabdpt,xgboost"
 CORRECTION_MODELS = ["tabpfn", "tabicl", "tabdpt"]
+# In-context models screened for softmax-input (logit-level) drift.
+INCONTEXT_MODELS = ["tabpfn", "tabicl", "tabdpt"]
 DATASETS = ["adult", "german_credit", "bank_marketing", "acs_income", "acs_coverage"]
 DTYPES = "fp32,fp16,bf16"
+
+# Independent fp32 forward passes per (in-context model, GPU) captured by the
+# `main` step, to calibrate the within-GPU nondeterminism floor for the
+# softmax-input (logit-level) drift e-tests. 1 = piggyback on the sweep pass
+# (no noise floor); >=2 adds that many-minus-one extra fp32 passes. Raise for
+# a tighter noise estimate at linear GPU cost.
+LOGIT_REPEATS = 3
 
 RESULTS_DIR = "results"
 
 
-def _steps() -> list[tuple[str, list[str]]]:
-    """(slug, argv) for every command in the sweep, in run order."""
-    steps: list[tuple[str, list[str]]] = []
+def _steps() -> list[tuple[str, list[str], bool]]:
+    """(slug, argv, local) for every command in the sweep, in run order.
+    ``local`` runs ``uv run python <argv>`` instead of ``uv run modal run``."""
+    steps: list[tuple[str, list[str], bool]] = []
+
+    # 1. Cheap screening pass first: fp32 in-context logit capture only, then
+    #    the logit-level (softmax-input) drift e-test -- gates/pre-empts the
+    #    full sweep below.
     for ds in DATASETS:
         steps.append(
-            (f"main-{ds}", ["modal_app.py::main", "--dataset", ds, "--models", MODELS_MAIN])
+            (
+                f"logits-{ds}",
+                [
+                    "modal_app.py::main",
+                    "--dataset", ds,
+                    "--models", ",".join(INCONTEXT_MODELS),
+                    "--collect-logits",
+                    "--logit-repeats", str(LOGIT_REPEATS),
+                    "--logits-only",
+                ],
+                False,
+            )
+        )
+    steps.append(("logit-screen", ["evalue_analysis.py", "--logit-only"], True))
+
+    # 2. Full hardware/precision sweep (logits already captured above).
+    for ds in DATASETS:
+        steps.append(
+            (
+                f"main-{ds}",
+                ["modal_app.py::main", "--dataset", ds, "--models", MODELS_MAIN],
+                False,
+            )
         )
     for ds in DATASETS:
         for model in CORRECTION_MODELS:
@@ -48,18 +84,27 @@ def _steps() -> list[tuple[str, list[str]]]:
                         "--model", model,
                         "--dtypes", DTYPES,
                     ],
+                    False,
                 )
             )
     steps.append(
-        ("drift_correlation", ["modal_app.py::drift_correlation", "--models", ",".join(CORRECTION_MODELS)])
+        (
+            "drift_correlation",
+            ["modal_app.py::drift_correlation", "--models", ",".join(CORRECTION_MODELS)],
+            False,
+        )
     )
+    # 3. Post-runtime: full e-value tests (metric-level + logit-level) over
+    #    everything the sweep wrote.
+    steps.append(("evalues", ["evalue_analysis.py"], True))
     return steps
 
 
-def _run(argv: list[str], log_path: str, combined) -> int:
-    """Run `uv run modal run <argv>`, teeing output to console, `log_path`,
-    and the shared `combined` handle. Returns the exit code."""
-    cmd = ["uv", "run", "modal", "run", *argv]
+def _run(argv: list[str], log_path: str, combined, local: bool = False) -> int:
+    """Run `uv run modal run <argv>` (or `uv run python <argv>` when
+    ``local``), teeing output to console, `log_path`, and the shared
+    `combined` handle. Returns the exit code."""
+    cmd = ["uv", "run", "python", *argv] if local else ["uv", "run", "modal", "run", *argv]
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     header = f"\n$ {' '.join(cmd)}\n"
     print(header, end="", flush=True)
@@ -93,14 +138,13 @@ def main() -> int:
     steps = _steps()
     outcomes: list[tuple[str, float, int, str]] = []
     with open(combined_path, "w", encoding="utf-8") as combined:
-        for i, (slug, argv) in enumerate(steps, 1):
-            entry = argv[0].split("::")[1]
+        for i, (slug, argv, local) in enumerate(steps, 1):
             log_path = os.path.join(log_dir, f"{i:02d}-{slug}.log")
             print(f"\n===== [{i}/{len(steps)}] {slug} =====", flush=True)
             combined.write(f"\n===== [{i}/{len(steps)}] {slug} =====\n")
             start = time.time()
             try:
-                code = _run(argv, log_path, combined)
+                code = _run(argv, log_path, combined, local)
             except Exception as exc:  # noqa: BLE001 -- record and keep going
                 combined.write(f"runner error: {exc!r}\n")
                 print(f"runner error: {exc!r}", flush=True)

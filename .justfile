@@ -43,19 +43,27 @@ run-tabpfn:
 run-fp32:
     uv run modal run modal_app.py::main --fp32-only
 
-# Full experiment: sweep TabPFN + TabICL + TabDPT across every dataset x GPU x
-# dtype (fp32 + fp16 + bf16, the `main` defaults), then run the correction-vector
-# intervention for each of those models on each dataset, then the drift
-# correlation. Driven by run_quick.py, which also:
-#   - tees every step's stdout+stderr to results/logs/run-quick-<timestamp>/
-#     (per-step logs + run-quick.log + summary.txt) and keeps going past a
-#     failed step;
-#   - writes per-prediction logs to results/predictions/*.json (per-row
-#     correct/incorrect + sensitive-feature labels) for offline fairness
-#     analysis without re-running the pipeline.
-# Writes results/*.json, results/predictions/*.json, results/logs/run-quick-*/.
+# Full experiment, driven by run_quick.py in this order:
+#   1. cheap fp32 in-context logit capture (results/logits/) + the logit-level
+#      (softmax-input) drift e-test -- screening pass, runs first;
+#   2. the hardware/precision sweep: TabPFN + TabICL + TabDPT x every dataset x
+#      GPU x dtype (fp32+fp16+bf16), then the correction-vector intervention
+#      per model/dataset, then the drift correlation;
+#   3. the full metric-level + logit-level e-value analysis.
+# run_quick.py also tees every step's stdout+stderr to
+# results/logs/run-quick-<timestamp>/ (per-step logs + run-quick.log +
+# summary.txt), keeps going past a failed step, and writes per-prediction logs
+# to results/predictions/*.json (per-row correct/incorrect + y_pred + sensitive
+# labels) so the e-tests / other post-analysis never re-run the pipeline.
+# Writes results/{results,predictions,logits,evalues,logs}/*.
 run-quick:
     uv run python run_quick.py
+
+# E-value tests for cross-hardware drift over existing results/ artifacts
+# (no Modal). --logit-only / --metric-only / --alpha / --ref. Writes
+# results/evalues/{metric,logit}_level.json.
+evalues *ARGS:
+    uv run python evalue_analysis.py {{ARGS}}
 
 # Cross-hardware logit-drift vs fairness-shift correlation (T4 reference):
 # 5 GPU x 5 dataset grid per model, one Pearson R each. Writes

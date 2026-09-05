@@ -262,7 +262,23 @@ def prepare_data(dataset: str = DEFAULT_DATASET, train_baselines: bool = True, r
     secrets=[modal.Secret.from_name("tabpfn-token")],
     volumes={CACHE_DIR: data_volume},
 )
-def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
+def run_inference(
+    dataset: str,
+    model_name: str,
+    dtype_name: str,
+    repeats: int = 1,
+    return_logits: bool = False,
+) -> dict:
+    """One hardware/precision config. Returns aggregate fairness metrics plus
+    per-row ``correct`` (1/0) and ``y_pred``.
+
+    ``return_logits`` (in-context models only): also return ``logprob`` --
+    ``repeats`` independent forward passes of per-row ``log(predict_proba)``,
+    shape ``(repeats, N_test, C)``. Pass 0's argmax is used as ``y_pred`` so
+    the hard predictions match the logged softmax inputs exactly (identical to
+    ``predict()`` for these models -- ``predict`` is argmax of
+    ``predict_proba``). ``repeats > 1`` gives the within-GPU nondeterminism
+    floor for the logit-drift e-tests; it costs one extra forward pass each."""
     import numpy as np
     import pandas as pd
     import torch
@@ -270,12 +286,15 @@ def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
     from tabular_exp.fairness import correct_vector, summarize
     from tabular_exp.models import (
         predict_mlp,
+        predict_proba_incontext,
         predict_tabdpt,
         predict_tabfm,
         predict_tabicl,
         predict_tabpfn,
         predict_xgboost,
     )
+
+    incontext = {"tabpfn", "tabicl", "tabfm", "tabdpt"}
 
     data = _load_prepared(dataset)
     X_train = np.array(data["X_train"], dtype=np.float32)
@@ -287,7 +306,19 @@ def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = getattr(torch, DTYPES[dtype_name])
 
-    if model_name == "tabpfn":
+    logprob_runs = n_classes = None
+    if return_logits and model_name in incontext:
+        n_passes = max(1, repeats)
+        probas = [
+            np.asarray(predict_proba_incontext(model_name, X_train, y_train, X_test, device, dtype))
+            for _ in range(n_passes)
+        ]
+        preds = probas[0].argmax(axis=1)
+        n_classes = int(probas[0].shape[1])
+        logprob_runs = [
+            np.round(np.log(np.clip(p, 1e-12, 1.0)), 6).tolist() for p in probas
+        ]
+    elif model_name == "tabpfn":
         preds = predict_tabpfn(X_train, y_train, X_test, device, dtype)
     elif model_name == "tabicl":
         preds = predict_tabicl(X_train, y_train, X_test, device, dtype)
@@ -302,12 +333,18 @@ def run_inference(dataset: str, model_name: str, dtype_name: str) -> dict:
     else:
         raise ValueError(model_name)
 
+    preds = np.asarray(preds)
     metrics = summarize(y_test, preds, sensitive_test)
-    return {
+    out = {
         "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "correct": correct_vector(y_test, preds),
+        "y_pred": preds.astype(int).tolist(),
         **metrics,
     }
+    if logprob_runs is not None:
+        out["logprob"] = logprob_runs
+        out["n_classes"] = n_classes
+    return out
 
 
 @app.function(
@@ -456,18 +493,21 @@ def fit_and_eval_correction(
     calib_lp = {g: np.array(calib_logprob_by_gpu[g], dtype=np.float64) for g in gpus}
     n_classes = test_lp[gpus[0]].shape[1]
 
-    # variant key ("baseline" / "acc_weight=<w>") -> {gpu: correct[]}, drained
-    # by the caller into a normalized prediction log.
-    correct_log: dict[str, dict[str, list[int]]] = {}
+    # variant key ("baseline" / "acc_weight=<w>") -> {gpu: {"correct", "y_pred"}},
+    # drained by the caller into a normalized prediction log.
+    pred_log: dict[str, dict[str, dict]] = {}
 
     def eval_c(c: np.ndarray, variant: str) -> dict:
         per_gpu = {}
-        by_gpu_correct = {}
+        by_gpu = {}
         for g in gpus:
             preds = apply_correction(test_lp[g], c).argmax(axis=1)
             per_gpu[g] = summarize(y_test, preds, sensitive_test)
-            by_gpu_correct[g] = correct_vector(y_test, preds)
-        correct_log[variant] = by_gpu_correct
+            by_gpu[g] = {
+                "correct": correct_vector(y_test, preds),
+                "y_pred": preds.astype(int).tolist(),
+            }
+        pred_log[variant] = by_gpu
         accs = [per_gpu[g]["accuracy"] for g in gpus]
         dps = [per_gpu[g]["demographic_parity_diff"] for g in gpus]
         acc_by_gpu = {g: per_gpu[g]["accuracy"] for g in gpus}
@@ -510,9 +550,9 @@ def fit_and_eval_correction(
         )
 
     predictions = []
-    for variant, by_gpu in correct_log.items():
+    for variant, by_gpu in pred_log.items():
         is_baseline = variant == "baseline"
-        for g, correct in by_gpu.items():
+        for g, rec in by_gpu.items():
             predictions.append(
                 {
                     "model": model_name,
@@ -520,7 +560,8 @@ def fit_and_eval_correction(
                     "gpu": g,
                     "variant": "baseline" if is_baseline else "corrected",
                     "acc_weight": None if is_baseline else float(variant.split("=")[1]),
-                    "correct": correct,
+                    "correct": rec["correct"],
+                    "y_pred": rec["y_pred"],
                 }
             )
     results["prediction_log"] = {
@@ -666,7 +707,13 @@ def drift_points(dataset: str, test_logprob_by_gpu: dict, model: str = "") -> di
             "y_true": y_test.tolist(),
             "sensitive": sensitive_labels(sensitive_test),
             "predictions": [
-                {"model": model, "dtype": "fp32", "gpu": g, "correct": correct_vector(y_test, preds_by_gpu[g])}
+                {
+                    "model": model,
+                    "dtype": "fp32",
+                    "gpu": g,
+                    "correct": correct_vector(y_test, preds_by_gpu[g]),
+                    "y_pred": preds_by_gpu[g].astype(int).tolist(),
+                }
                 for g in gpus
             ],
         },
@@ -756,6 +803,9 @@ def sensitivity(dataset: str = DEFAULT_DATASET, refresh_data: bool = False):
     _write_json(_out_path("sensitivity_results", dataset), out)
 
 
+INCONTEXT_MODELS = ("tabpfn", "tabicl", "tabfm", "tabdpt")
+
+
 @app.local_entrypoint()
 def main(
     dataset: str = DEFAULT_DATASET,
@@ -764,7 +814,26 @@ def main(
     models: str = "",
     dtypes: str = "",
     refresh_data: bool = False,
+    collect_logits: bool = False,
+    logit_repeats: int = 1,
+    logits_only: bool = False,
 ):
+    """Hardware/precision sweep. Writes results/results[-<dataset>].json and
+    the per-prediction log results/predictions/predictions-<dataset>.json
+    (per-row ``correct`` / ``y_pred`` + sensitive labels, per config).
+
+    ``--collect-logits`` additionally captures, for the in-context models at
+    **fp32** (precision held fixed so only hardware varies), ``logit_repeats``
+    independent forward passes of per-row ``log(predict_proba)`` on every GPU,
+    to results/logits/logits-<dataset>-<model>-fp32.json -- the input to the
+    softmax-input (logit-level) drift e-tests. ``--logit-repeats N`` (N >= 2)
+    gives the within-GPU nondeterminism floor those tests calibrate against;
+    it costs N-1 extra fp32 forward passes per (in-context model, GPU).
+
+    ``--logits-only`` runs *just* that fp32 in-context logit capture (no
+    hard-prediction sweep, no results.json / prediction log) -- the cheap
+    screening pass that `just run-quick` runs first, so the logit-level
+    e-test can gate the full sweep."""
     ALL_MODELS = ["tabpfn", "tabicl", "tabfm", "tabdpt", "mlp", "xgboost"]
     if models:
         models = [m for m in models.split(",") if m]
@@ -772,8 +841,12 @@ def main(
         models = ["tabpfn"]
     else:
         models = ALL_MODELS
+    if logits_only:
+        collect_logits = True
+        models = [m for m in models if m in INCONTEXT_MODELS]
+        fp32_only = True
     dtype_override = [d for d in dtypes.split(",") if d] or None
-    need_baselines = any(m in ("mlp", "xgboost") for m in models)
+    need_baselines = (not logits_only) and any(m in ("mlp", "xgboost") for m in models)
 
     # Populate the dataset cache once (blocks until committed), then fan out.
     prepare_data.remote(dataset=dataset, train_baselines=need_baselines, refresh=refresh_data)
@@ -791,15 +864,31 @@ def main(
             for gpu in GPU_TYPES:
                 if model_name == "xgboost" and gpu != GPU_TYPES[0]:
                     continue  # deterministic tree traversal: run once as the invariant control
-                call = run_inference.with_options(gpu=gpu).spawn(dataset, model_name, dtype_name)
-                pending.append(({"model": model_name, "gpu": gpu, "dtype": dtype_name}, call))
+                want_logits = (
+                    collect_logits and model_name in INCONTEXT_MODELS and dtype_name == "fp32"
+                )
+                call = run_inference.with_options(gpu=gpu).spawn(
+                    dataset,
+                    model_name,
+                    dtype_name,
+                    logit_repeats if want_logits else 1,
+                    want_logits,
+                )
+                pending.append(
+                    ({"model": model_name, "gpu": gpu, "dtype": dtype_name, "logits": want_logits}, call)
+                )
 
     results = []
     pred_entries = []
+    # model -> {"gpus": [...], "device_name": {gpu: name}, "logprob": {gpu: (R,N,C)}}
+    logit_bundles: dict = {}
     for meta, call in pending:
         out = call.get()
         correct = out.pop("correct")
-        results.append({**meta, **out})
+        y_pred = out.pop("y_pred")
+        logprob = out.pop("logprob", None)
+        n_classes = out.pop("n_classes", None)
+        results.append({**{k: v for k, v in meta.items() if k != "logits"}, **out})
         pred_entries.append(
             {
                 "model": meta["model"],
@@ -807,19 +896,47 @@ def main(
                 "gpu": meta["gpu"],
                 "device_name": out["device_name"],
                 "correct": correct,
+                "y_pred": y_pred,
             }
         )
+        if logprob is not None:
+            b = logit_bundles.setdefault(
+                meta["model"], {"device_name": {}, "logprob": {}, "n_classes": n_classes}
+            )
+            b["device_name"][meta["gpu"]] = out["device_name"]
+            b["logprob"][meta["gpu"]] = logprob
         print(f"{meta['model']:8s} {meta['gpu']:6s} {meta['dtype']:5s} acc={out['accuracy']:.4f}")
 
-    _write_json(_out_path("results", dataset), results)
-    _write_prediction_log(
-        f"predictions-{dataset}.json",
-        {
-            "dataset": dataset,
-            "entrypoint": "main",
-            "n_test": len(labels["y_test"]),
-            "y_true": labels["y_test"],
-            "sensitive": labels["sensitive_test"],
-            "predictions": pred_entries,
-        },
-    )
+    if not logits_only:
+        _write_json(_out_path("results", dataset), results)
+        _write_prediction_log(
+            f"predictions-{dataset}.json",
+            {
+                "dataset": dataset,
+                "entrypoint": "main",
+                "n_test": len(labels["y_test"]),
+                "y_true": labels["y_test"],
+                "sensitive": labels["sensitive_test"],
+                "predictions": pred_entries,
+            },
+        )
+    for model_name, b in logit_bundles.items():
+        gpus = sorted(b["logprob"])
+        _write_json(
+            os.path.join(RESULTS_DIR, "logits", f"logits-{dataset}-{model_name}-fp32.json"),
+            {
+                "dataset": dataset,
+                "model": model_name,
+                "dtype": "fp32",
+                "reference_gpu": "T4" if "T4" in gpus else gpus[0],
+                "n_test": len(labels["y_test"]),
+                "n_classes": b["n_classes"],
+                "repeats": logit_repeats,
+                "gpus": gpus,
+                "device_name": b["device_name"],
+                "y_true": labels["y_test"],
+                "sensitive": labels["sensitive_test"],
+                # per GPU: shape (repeats, n_test, n_classes), log(predict_proba)
+                "logprob": {g: b["logprob"][g] for g in gpus},
+            },
+        )
