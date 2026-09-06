@@ -83,3 +83,74 @@ select {
 .error {
   color: #ff8080;
 }
+
+/* ---- e-value heatmap ---- */
+
+.heat {
+  display: grid;
+  gap: 3px;
+  margin: 6px 0 4px;
+  overflow-x: auto;
+}
+
+.heat-corner {
+  font-size: 10px;
+  color: var(--muted);
+  align-self: end;
+  padding-bottom: 6px;
+  letter-spacing: 0.02em;
+}
+
+.heat-col {
+  text-align: center;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.heat-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.heat-cell {
+  text-align: center;
+  padding: 11px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  cursor: default;
+}
+
+.heat-cell.heat-rej {
+  border-color: #f7768e;
+  color: #fff;
+  font-weight: 600;
+}
+
+.heat-cell.heat-empty {
+  color: var(--muted);
+  opacity: 0.35;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-end;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.pill-hot {
+  border-color: #f7768e;
+  color: #f7768e;
+}
