@@ -3,7 +3,7 @@
 Measuring **hardware-induced fairness variance** in frozen tabular models: how
 much do per-subgroup accuracy and fairness disparities move when only the GPU
 type or compute dtype (fp32/fp16/bf16) changes, with weights, data, and seed
-fixed? Ported from arXiv:2312.03886 to TabPFN / TabICL / TabDPT / MLP / XGBoost
+fixed? TabPFN / TabICL / TabDPT / MLP / XGBoost
 (XGBoost is the near-zero control). Datasets: adult, german_credit,
 bank_marketing, acs_income, acs_coverage.
 
